@@ -114,6 +114,19 @@ export function compactSession(req: CompactRequest): CompactResult {
   // after an hour belongs to a process that is not coming back.
   sweepStaleStagingFiles(req.sdkSessionsDir);
 
+  // A blank summary would replace the whole period with an empty block and
+  // archive the originals out of the live session — reported as success. This
+  // happens in practice when the caller builds the text with
+  // `--summary "$(cat file)"` and the file is gone (a reboot clears /tmp): the
+  // shell substitutes "" and commander accepts it as a value. Refuse before
+  // touching anything, for every entry point (CLI levels, `compact`, MCP).
+  if (req.summary.trim() === "") {
+    return {
+      success: false, eventsRemoved: 0, eventsAfter: 0,
+      error: "Summary is empty — refusing to replace events with a blank block",
+    };
+  }
+
   const path = getSdkSessionPath(req.sdkSessionId, req.sdkSessionsDir);
   if (!existsSync(path)) {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };

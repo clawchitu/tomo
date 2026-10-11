@@ -266,6 +266,42 @@ describe("compactSession", () => {
     expect(out[2].parentUuid).toBe(out[1].uuid);
   });
 
+  it.each(["", "   \n\t "])("refuses a blank summary and leaves the session untouched (%j)", (blank) => {
+    // Regression: `--summary "$(cat /tmp/x)"` after a reboot cleared /tmp
+    // passed "" through, and the period was replaced by an empty block with
+    // status ok.
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0
+        ? mkUserEvent(parent, ts, `msg ${i}`)
+        : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    const original = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, original);
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      expectedFirstUuid: events[1].uuid,
+      expectedLastUuid: events[3].uuid,
+      summary: blank,
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/empty/i);
+    expect(readFileSync(path, "utf-8")).toBe(original);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(stagingLeftovers()).toEqual([]);
+  });
+
   it("aborts cleanly when the first range anchor is stale", () => {
     const events: any[] = [];
     let parent: string | null = null;
