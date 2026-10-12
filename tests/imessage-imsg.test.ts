@@ -90,7 +90,7 @@ const defaultResponder: Responder = (req, child) => {
 const CAPS_FULL: ImsgCapabilities = {
   rpcMethods: new Set(["send", "send.rich", "tapback", "typing", "read", "message.unsend", "message.edit", "watch.subscribe"]),
   advancedFeatures: true,
-  selectors: { retractMessagePart: true, editMessageItem: false, editMessage: false },
+  selectors: { retractMessagePart: true, editMessageItem: false, editMessage: false, editMessageItemTranslation: false },
   typingIndicators: true,
   readReceipts: true,
 };
@@ -3652,6 +3652,7 @@ describe("imsg capability gate diagnosis", () => {
       "rpcMethods.message.edit": true,
       "selectors.editMessageItem": false,
       "selectors.editMessage": false,
+      "selectors.editMessageItemTranslation": false,
     });
     expect(diag.verdict).toMatch(/probed FALSE by the live bridge/);
     await channel.stop();
@@ -3740,6 +3741,29 @@ describe("imsg tapback, unsend, and edit", () => {
       text: "fixed text",
       backwards_compatibility_message: "Edited to: fixed text",
       part_index: 0,
+    });
+    await channel.stop();
+  });
+
+  it("edits via message.edit when only the macOS 26+ translation-aware selector is probed", async () => {
+    // Ground truth for macOS 26/27: editMessageItem and editMessage are gone,
+    // but editMessageItem:atPartIndex:withNewPartText:newPartTranslation:
+    // backwardCompatabilityText: exists and imsg reports it as
+    // editMessageItemTranslation (live-verified on macOS 27, imsg 0.15.9).
+    const caps: ImsgCapabilities = {
+      ...CAPS_FULL,
+      selectors: { ...CAPS_FULL.selectors, editMessageItemTranslation: true },
+    };
+    const { channel, requests } = makeChannel({ caps });
+    await channel.start();
+
+    expect(channel.isEditSupported()).toBe(true);
+    await channel.editMessage(DM_GUID, "mine-1", "fixed text");
+
+    expect(requests().find((r) => r.method === "message.edit")?.params).toMatchObject({
+      chat_guid: DM_GUID,
+      message_guid: "mine-1",
+      text: "fixed text",
     });
     await channel.stop();
   });
