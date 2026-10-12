@@ -876,22 +876,26 @@ export class ImsgChannel implements Channel {
     return this.capabilities.advancedFeatures
       && this.capabilities.rpcMethods.has("message.edit")
       && (this.capabilities.selectors.editMessageItem === true
-        || this.capabilities.selectors.editMessage === true);
+        || this.capabilities.selectors.editMessage === true
+        // macOS 26+ replaced both with editMessageItem:atPartIndex:withNewPartText:
+        // newPartTranslation:backwardCompatabilityText:, which imsg probes and
+        // calls as `editMessageItemTranslation`.
+        || this.capabilities.selectors.editMessageItemTranslation === true);
   }
 
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
     if (!text.trim()) throw new Error("Edited message text cannot be empty");
-    // Apple removed both IMCore edit selectors (editMessageItem and the older
-    // editMessage) in macOS 26 — calling message.edit blindly is what crashed
-    // Messages.app in #227. Only proceed when the startup selector probe
-    // confirmed one of them exists.
+    // Apple removed both legacy IMCore edit selectors (editMessageItem and the
+    // older editMessage) in macOS 26 and added a translation-aware variant —
+    // calling message.edit blindly is what crashed Messages.app in #227. Only
+    // proceed when the startup selector probe confirmed one of them exists.
     if (!this.isEditSupported()) {
       // No-op unless the BRIDGE itself is down (a stale degraded snapshot,
       // #258). A missing edit selector with a live bridge is a real OS-level
       // limit (macOS 26 removed both selectors) that no re-probe can change.
       this.maybeReprobeCapabilities();
       log.warn(
-        { chatId, messageId, ...this.capabilityGateDiagnosis("message.edit", ["editMessageItem", "editMessage"]) },
+        { chatId, messageId, ...this.capabilityGateDiagnosis("message.edit", ["editMessageItem", "editMessage", "editMessageItemTranslation"]) },
         "imsg message edit refused by capability gate",
       );
       throw new Error(
