@@ -8,6 +8,8 @@ import {
   isGroupSessionKey,
   isDmSessionKey,
   dmIdentityFromSessionKey,
+  dmSessionKeyForIdentity,
+  matchesChannelBinding,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -29,7 +31,7 @@ import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
+import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
 import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
 import { isSilentReply } from "./agent/text-utils.js";
@@ -40,7 +42,8 @@ import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
@@ -94,6 +97,8 @@ interface UserTurnRequest {
   steerAudience: string[];
   /** True for turns where most inputs are expected to resolve to NO_REPLY. */
   passiveListen?: boolean;
+  /** Owner DM notice for an error `suppressErrors` keeps out of the chat. */
+  ownerNotice?: OwnerNoticeTarget;
   /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",
    *  or a raw group key for a summoned group's messages. Session-scoped MCP
    *  tools resolve against these, not against the session key. */
@@ -123,6 +128,9 @@ interface CronTurnOptions {
    *  a session turn that the handoff target may be waiting on — see
    *  processCronMessage. */
   waitForHandoff?: boolean;
+  /** The cron job's name, for the owner notice when its failure is kept out
+   *  of a group (see agent/owner-error-notice.ts). */
+  jobName?: string;
   /** The audience this turn carries from the session that ASKED for it —
    *  `send_message(mode: "delegate")`, or a group's background turn handed to
    *  the summoning dm: session. Registered in the TurnAudienceRegistry for the
@@ -240,6 +248,14 @@ export class Agent {
    * it failed. Shutdown wins; the request is dropped, with a line saying so.
    */
   private stopping = false;
+  /** End time of each session's last successful turn this process saw — the
+   *  start of the range an owner notice suggests compacting. */
+  private readonly lastGoodTurnAt = new Map<string, number>();
+  /** Owner DMs for errors kept out of a chat (rate-limited). */
+  private readonly ownerErrorNotifier = new OwnerErrorNotifier({
+    send: (text, report) => this.sendOwnerNotice(text, report.deliverTo),
+    enabled: () => config.notifyOwnerOnSuppressedErrors !== false,
+  });
   private proactive: ProactiveSendService;
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
@@ -283,6 +299,8 @@ export class Agent {
       delivery: this.delivery,
       undeliveredReplyAtTurnEnd: (sessionKey) => this.liveSessionManager.takeUndeliveredReply(sessionKey),
       requestRestate: (sessionKey, target) => this.restateUndeliveredReply(sessionKey, target),
+      reportSuppressedError: (sessionKey, target, detail) => this.reportSuppressedError(sessionKey, target, detail),
+      recordTurnOutcome: (sessionKey, ok) => { if (ok) this.lastGoodTurnAt.set(sessionKey, Date.now()); },
     });
     const summons = new SummonStore(
       join(config.tomoHome, "data", "summons.json"),
@@ -1061,6 +1079,12 @@ export class Agent {
         if (settled) return;
         settled = true;
         log.error({ err, key }, "Background task turn failed");
+        // Nothing is delivered for a failed background turn, on any session,
+        // so nobody hears of it unless the owner is told.
+        if (!(err instanceof TurnInterruptedError)) {
+          const target = this.ownerNoticeTarget(key, "A background task turn");
+          if (target) this.reportSuppressedError(key, target, err instanceof Error ? err.message : String(err));
+        }
         await stop();
       },
     };
@@ -1353,6 +1377,7 @@ export class Agent {
         response: "deliver",
         thrown: req.suppressErrors ? "ignore" : "deliver",
         thrownLogMessage: req.errorLogMessage,
+        ...(req.suppressErrors && req.ownerNotice ? { ownerNotice: req.ownerNotice } : {}),
       },
     });
   }
@@ -1469,6 +1494,7 @@ export class Agent {
       documents: message.documents,
       audiences,
       suppressErrors: isPassiveGroup,
+      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
       errorLogMessage: "Error handling message",
       steer,
       steerAudience: audience,
@@ -1620,6 +1646,7 @@ export class Agent {
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       audiences,
       suppressErrors: isPassiveGroup,
+      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
       steer,
       // PER ITEM, not per batch, IN `numbered`'s ORDER. `summonTargets` (the
@@ -1867,6 +1894,21 @@ export class Agent {
           thrown: suppressErrorDelivery ? "note-only" : "deliver",
           thrownSuppressedLog: "Thrown cron error suppressed from chat delivery",
           thrownLogMessage: "Cron message handling failed",
+          // Any error held back from the chat is news to the owner — on the
+          // owner's own DM too: a silent housekeeping turn failing on an
+          // expired login is otherwise only a pending note for a next turn
+          // that fails the same way.
+          ...(suppressErrorDelivery
+            ? {
+              ownerNotice: this.ownerNoticeTarget(
+                key,
+                options.jobName ? `Cron job "${options.jobName}"` : "A background turn",
+                // A group's turn handed to the summoned dm: session (or a
+                // group's delegate) is still the group's failure.
+                options.audiences?.find((a) => isGroupSessionKey(a)),
+              ),
+            }
+            : {}),
         },
       });
     } finally {
@@ -1890,7 +1932,7 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
-    return this.enqueueForSession(key, () => this.processContinuity(prompt, key))
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn"))
       .catch((err) => {
         log.error({ err, sessionKey: key }, "Continuity failed in queue");
       });
@@ -1927,22 +1969,25 @@ export class Agent {
     // group is summoned, is the group's turn wherever it runs — same rule as
     // the cron handoff in processCronMessage.
     const audiences = summonedKey ? [sessionKey] : undefined;
-    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences))
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn"))
       .catch((err) => {
         log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
   }
 
-  private async processContinuity(prompt: string, key: string, audiences?: string[]): Promise<void> {
+  private async processContinuity(prompt: string, key: string, audiences: string[] | undefined, turnKind: string): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
     try {
-      await this.runContinuityTurn(prompt, key);
+      // A summoned group's restart notice runs on the owner's dm: session;
+      // its failure still belongs to (and is reported as) the group's.
+      const groupKey = audiences?.find((a) => isGroupSessionKey(a));
+      await this.runContinuityTurn(prompt, key, turnKind, groupKey);
     } finally {
       if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
-  private async runContinuityTurn(prompt: string, key: string): Promise<void> {
+  private async runContinuityTurn(prompt: string, key: string, turnKind: string, noticeGroupKey?: string): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
@@ -1992,6 +2037,10 @@ export class Agent {
         responseSuppressedLog: "Continuity returned an agent error response",
         thrown: "ignore",
         thrownLogMessage: "Continuity heartbeat failed",
+        // Nothing from a continuity turn is ever delivered, error included —
+        // an expired login fails every heartbeat silently unless the owner
+        // is told (rate-limited, so an hourly heartbeat cannot spam).
+        ownerNotice: this.ownerNoticeTarget(key, turnKind, noticeGroupKey),
       },
     });
   }
@@ -2315,6 +2364,99 @@ export class Agent {
       },
     })).catch((err) => {
       log.error({ err, sessionKey: key }, "Watch chat failed in queue");
+    });
+  }
+
+  /**
+   * Owner-notice target for a failure kept out of a chat (see
+   * agent/owner-error-notice.ts). `groupKey` names the group a summoned turn
+   * belongs to when it runs on the owner's dm: session.
+   *
+   * - a group: reported to the owner's DM (resolveOwnerNoticeTarget), never
+   *   the group — or, for a summoned group, to the dm: session it ran on;
+   * - an identity's dm: session: reported IN that DM — the error was held
+   *   back there, so this is the only visible trace of it;
+   * - a raw private chat (not an identity): reported to the owner, not to
+   *   whoever that chat belongs to.
+   *
+   * Callers attach a target only where the turn's policy suppresses errors;
+   * an error delivered visibly is never reported again.
+   */
+  private ownerNoticeTarget(sessionKey: string, turnKind: string, groupKey?: string): OwnerNoticeTarget {
+    const noticeKey = groupKey !== undefined && isGroupSessionKey(groupKey) ? groupKey : sessionKey;
+    // The turn ran on an identity's dm: session (its own turn, or a summoned
+    // group's): the notice goes to THAT identity's DM, where /rewind works.
+    const ranOnDm = isDmSessionKey(sessionKey);
+    const deliver = ranOnDm ? { rewindable: true, deliverTo: sessionKey } : {};
+    if (isGroupSessionKey(noticeKey)) {
+      const title = this.sessions.getEntry(noticeKey)?.chatTitle;
+      return {
+        noticeKey,
+        label: title ? `group "${title}" (${noticeKey})` : `group ${noticeKey}`,
+        turnKind,
+        ...deliver,
+      };
+    }
+    if (ranOnDm) return { noticeKey, label: `this DM session (${noticeKey})`, turnKind, ...deliver };
+    return { noticeKey, label: `private chat ${noticeKey}`, turnKind };
+  }
+
+  /**
+   * Where an owner notice goes — resolved STRICTLY through a configured
+   * identity, never through a raw session key. A notice carries a group's
+   * title, key, error text and session id; `sendNotification`'s fallback to
+   * "the first private chat with a session" could hand that to whoever else
+   * has messaged Tomo privately.
+   *
+   * - `deliverTo` (a dm: session the turn ran on): that identity's own DM.
+   * - otherwise: the owner identity — `web.ownerIdentity` when set (the same
+   *   selection the local web UI uses), else the first configured identity.
+   *
+   * Undefined when no identity resolves to a loaded channel.
+   */
+  private resolveOwnerNoticeTarget(deliverTo: string | undefined): { channel: Channel; chatId: string } | undefined {
+    const identityName = deliverTo !== undefined
+      ? dmIdentityFromSessionKey(deliverTo)
+      : (this.router.webOwner() ?? config.identities[0])?.name;
+    if (identityName === undefined) return undefined;
+    const identity = config.identities.find((id) => id.name.toLowerCase() === identityName.toLowerCase());
+    if (!identity) return undefined;
+    // The persisted last-active target is used only while it is still one of
+    // the identity's CURRENT private bindings — a rebinding, or a binding to
+    // a group id, must not carry a notice somewhere else.
+    const isPrivateBinding = (t: ReplyTarget | undefined): t is ReplyTarget => t !== undefined
+      && !isGroupSessionKey(`${t.channelName}:${t.chatId}`)
+      && matchesChannelBinding(t.channelName, t.chatId, identity.channels[t.channelName]);
+    const persisted = this.router.getReplyTarget(dmSessionKeyForIdentity(identity.name));
+    const configured = this.router.deriveReplyTargetFromConfig(identity.name);
+    const target = isPrivateBinding(persisted) ? persisted : isPrivateBinding(configured) ? configured : undefined;
+    if (!target) return undefined;
+    const channel = this.getChannel(target.channelName);
+    return channel ? { channel, chatId: target.chatId } : undefined;
+  }
+
+  /** Deliver an owner notice; false (nothing sent) when no owner target. */
+  private async sendOwnerNotice(text: string, deliverTo: string | undefined): Promise<boolean> {
+    const target = this.resolveOwnerNoticeTarget(deliverTo);
+    if (!target) {
+      log.warn({ deliverTo }, "Owner error notice dropped: no configured owner identity with a reachable DM");
+      return false;
+    }
+    await target.channel.send({ chatId: target.chatId, text });
+    return true;
+  }
+
+  /** Fire-and-forget owner DM for a suppressed error; never throws. */
+  private reportSuppressedError(sessionKey: string, target: OwnerNoticeTarget, detail: string): void {
+    // A turn torn down by shutdown is not a failure worth a DM.
+    if (this.stopping) return;
+    const sdkSessionId = this.sessions.getSdkSessionId(sessionKey);
+    const lastGoodTurnAt = this.lastGoodTurnAt.get(sessionKey);
+    void this.ownerErrorNotifier.report({
+      ...target,
+      detail,
+      ...(sdkSessionId ? { sdkSessionId } : {}),
+      ...(lastGoodTurnAt !== undefined ? { lastGoodTurnAt } : {}),
     });
   }
 
