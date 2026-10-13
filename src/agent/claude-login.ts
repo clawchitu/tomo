@@ -1,4 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LOGIN_URL_RE = /https:\/\/claude\.com\/cai\/oauth\/authorize\?[^\s]+/;
@@ -46,7 +49,7 @@ export class ClaudeLoginManager {
   private readonly timeoutMs: number;
 
   constructor(options: ClaudeLoginManagerOptions = {}) {
-    this.spawnLogin = options.spawnLogin ?? (() => spawn("claude", ["auth", "login"], {
+    this.spawnLogin = options.spawnLogin ?? (() => spawn(resolveClaudeExecutable(), ["auth", "login"], {
       stdio: ["pipe", "pipe", "pipe"],
     }));
     this.verifyLogin = options.verifyLogin ?? verifyClaudeLogin;
@@ -203,7 +206,7 @@ export class ClaudeLoginManager {
 function verifyClaudeLogin(): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile(
-      "claude",
+      resolveClaudeExecutable(),
       ["-p", "Reply with exactly OK.", "--safe-mode", "--no-session-persistence", "--tools", ""],
       { timeout: 60_000 },
       (err, stdout, stderr) => {
@@ -216,4 +219,57 @@ function verifyClaudeLogin(): Promise<void> {
       },
     );
   });
+}
+
+/**
+ * The Claude Code binary to run `auth login` and the verification prompt with.
+ *
+ * Not a bare "claude" from PATH: under launchd PATH is minimal, so the
+ * user's ~/.local/bin install is invisible and the login fails with
+ * `spawn claude ENOENT` — at exactly the moment every model turn is failing
+ * on an expired token and /login is the only way back. The Agent SDK already
+ * ships the platform binary it runs the sessions with, so logging in through
+ * that same binary also writes the credentials the sessions will read.
+ *
+ * Order: an explicit TOMO_CLAUDE_PATH, the SDK's bundled platform binary,
+ * then "claude" from PATH as before.
+ */
+export function resolveClaudeExecutable(
+  env: NodeJS.ProcessEnv = process.env,
+  resolvePackage: (id: string) => string = (id) => createRequire(import.meta.url).resolve(id),
+  exists: (path: string) => boolean = existsSync,
+  platform: string = process.platform,
+  arch: string = process.arch,
+  isMusl: () => boolean = detectMusl,
+): string {
+  const explicit = env.TOMO_CLAUDE_PATH?.trim();
+  if (explicit) return explicit;
+  for (const name of bundledPackageNames(platform, arch, isMusl)) {
+    try {
+      const pkg = resolvePackage(`@anthropic-ai/${name}/package.json`);
+      const binary = join(dirname(pkg), platform === "win32" ? "claude.exe" : "claude");
+      if (exists(binary)) return binary;
+    } catch {
+      // Package not installed for this platform: try the next candidate.
+    }
+  }
+  return "claude";
+}
+
+/**
+ * The SDK's platform packages in the order the SDK itself tries them
+ * (mirrors its resolver, Android included): on
+ * Linux npm installs both the glibc and the musl build, and the glibc binary
+ * will not even start on a musl system, so musl goes first there.
+ */
+export function bundledPackageNames(platform: string, arch: string, isMusl: () => boolean): string[] {
+  if (platform === "android") return [`claude-agent-sdk-linux-${arch}-android`];
+  const base = `claude-agent-sdk-${platform}-${arch}`;
+  if (platform !== "linux") return [base];
+  return isMusl() ? [`${base}-musl`, base] : [base, `${base}-musl`];
+}
+
+function detectMusl(): boolean {
+  const report = process.report?.getReport?.() as { header?: { glibcVersionRuntime?: string } } | undefined;
+  return !report?.header?.glibcVersionRuntime;
 }
