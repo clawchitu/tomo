@@ -1,6 +1,19 @@
 import { describe, expect, it } from "vitest";
-import type { ExecFileException } from "node:child_process";
-import { buildUsageReport, formatCountdown, formatReset, formatUsageReport, keychainErrorMessage } from "../src/agent/usage.js";
+import type { ExecFileException, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  buildUsageReport,
+  CLAUDE_REFRESH_ARGS,
+  formatCountdown,
+  formatReset,
+  formatUsageReport,
+  keychainErrorMessage,
+  runClaudeRefresh,
+  type RefreshOutcome,
+} from "../src/agent/usage.js";
 
 // A fixed "now" so countdowns and clock times are deterministic.
 // 2026-07-27T15:36:00-07:00 == 2026-07-27T22:36:00Z
@@ -236,6 +249,265 @@ describe("buildUsageReport", () => {
       fetchImpl: (async () => new Response("", { status: 401 })) as unknown as typeof fetch,
     });
     expect(report).toContain("Re-login to Claude Code");
+  });
+
+  describe("stale access token with a refresh token", () => {
+    const USAGE_BODY = {
+      five_hour: { utilization: 2, resets_at: "2026-07-28T02:59:59+00:00" },
+      seven_day: { utilization: 36, resets_at: "2026-08-02T14:59:59+00:00" },
+    };
+    const STALE = { claudeAiOauth: { accessToken: "stale", refreshToken: "rt", expiresAt: NOW - 1000, subscriptionType: "max" } };
+    const FRESH = { claudeAiOauth: { accessToken: "fresh", refreshToken: "rt2", expiresAt: NOW + 3_600_000, subscriptionType: "max" } };
+
+    /** Credential store that returns `first`, then `afterRefresh` once refreshCredentials ran. */
+    function store(first: unknown, afterRefresh: unknown, outcome: RefreshOutcome = "completed") {
+      const state = { refreshes: 0, loads: 0 };
+      return {
+        state,
+        loadCredentials: async () => { state.loads++; return (state.refreshes > 0 ? afterRefresh : first) as typeof CREDS; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => { state.refreshes++; return outcome; },
+      };
+    }
+    const PENDING = "refreshes automatically on the next agent turn";
+
+    it("delegates the refresh to Claude Code, re-reads, and reports usage with the fresh token", async () => {
+      const s = store(STALE, FRESH);
+      const seenAuth: string[] = [];
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async (_url: string, init?: RequestInit) => {
+          seenAuth.push(new Headers(init?.headers).get("Authorization") ?? "");
+          return okResponse(USAGE_BODY);
+        }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(seenAuth).toEqual(["Bearer fresh"]);
+      expect(report).toContain("Session (5h):  2%");
+      expect(report).not.toContain("expired");
+    });
+
+    it("says the refresh failed (re-login if it persists) when Claude Code ran but the token is still expired", async () => {
+      const s = store(STALE, STALE, "completed");
+      let fetched = false;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { fetched = true; return okResponse(USAGE_BODY); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(fetched).toBe(false);
+      expect(report).toContain("token refresh failed");
+      expect(report).toContain("if this persists, re-login");
+      expect(report).not.toContain(PENDING);
+    });
+
+    it("does not tell the owner to re-login when the refresh timed out", async () => {
+      const s = store(STALE, STALE, "timed_out");
+      let fetched = false;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { fetched = true; return okResponse(USAGE_BODY); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(fetched).toBe(false);
+      expect(report).toContain(PENDING);
+      expect(report).not.toMatch(/re-login/i);
+    });
+
+    it("treats a throwing refresh as not attempted (next-turn wording)", async () => {
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => STALE,
+        refreshCredentials: async () => { throw new Error("spawn failed"); },
+      });
+      expect(report).toContain(PENDING);
+      expect(report).not.toContain("spawn failed");
+    });
+
+    it("gives a neutral try-again message (not 'refresh failed') when the post-refresh re-read fails", async () => {
+      let loads = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => { if (loads++ > 0) throw new Error("secret detail: keychain locked"); return STALE; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => "completed",
+      });
+      expect(report).toContain("couldn't read the Claude Code credentials after refreshing them");
+      expect(report).not.toContain("refresh failed");
+      expect(report).not.toMatch(/re-login/i);
+      expect(report).not.toContain("secret detail");
+    });
+
+    it("gives the same neutral message when the re-read after a 401 fails", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      let loads = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => { if (loads++ > 0) return null as unknown as typeof CREDS; return valid; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => "completed",
+        fetchImpl: (async () => new Response("", { status: 401 })) as unknown as typeof fetch,
+      });
+      expect(report).toContain("couldn't read the Claude Code credentials after refreshing them");
+      expect(report).not.toMatch(/re-login/i);
+    });
+
+    it("still asks to re-login when the token is expired and there is no refresh token", async () => {
+      let refreshes = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => ({ claudeAiOauth: { accessToken: "t", expiresAt: NOW - 1000 } }),
+        refreshCredentials: async (): Promise<RefreshOutcome> => { refreshes++; return "completed"; },
+      });
+      expect(refreshes).toBe(0);
+      expect(report).toContain("access token expired");
+      expect(report).toContain("Re-login to Claude Code");
+    });
+
+    it("on a 401 with a valid-looking expiry, refreshes and retries once with the new token", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      const s = store(valid, FRESH);
+      const seenAuth: string[] = [];
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async (_url: string, init?: RequestInit) => {
+          const auth = new Headers(init?.headers).get("Authorization") ?? "";
+          seenAuth.push(auth);
+          return auth === "Bearer fresh" ? okResponse(USAGE_BODY) : new Response("", { status: 401 });
+        }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(seenAuth).toEqual(["Bearer stale", "Bearer fresh"]);
+      expect(report).toContain("Weekly (7d):   36%");
+    });
+
+    it("on a 401 whose token didn't change after a timed-out refresh, doesn't retry and says next turn", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      const s = store(valid, valid, "timed_out");
+      let calls = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { calls++; return new Response("", { status: 401 }); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(calls).toBe(1);
+      expect(report).toContain(PENDING);
+      expect(report).not.toMatch(/re-login/i);
+    });
+
+    it("on a 401 that survives a completed refresh, says so and suggests re-login if it persists", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      const s = store(valid, valid, "completed");
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => new Response("", { status: 401 })) as unknown as typeof fetch,
+      });
+      expect(report).toContain("rejected the stored access token (401)");
+      expect(report).toContain("If this persists, re-login");
+      expect(report).not.toContain(PENDING);
+    });
+
+    it("refreshes at most once per /usage (expired, then 401 on the fresh token)", async () => {
+      const s = store(STALE, FRESH);
+      let calls = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { calls++; return new Response("", { status: 401 }); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(calls).toBe(1);
+      expect(report).toContain("rejected the stored access token (401)");
+    });
+  });
+
+  describe("runClaudeRefresh (real launcher, stub executable)", () => {
+    /** Write an executable node script into a fresh temp dir. */
+    function stub(body: string): { dir: string; bin: string } {
+      const dir = mkdtempSync(join(tmpdir(), "tomo-usage-stub-"));
+      const bin = join(dir, "claude");
+      writeFileSync(bin, `#!${process.execPath}\n${body}\n`);
+      chmodSync(bin, 0o755);
+      return { dir, bin };
+    }
+
+    it("runs the binary with the refresh argv and no stdin, and reports completed on exit", async () => {
+      const { dir, bin } = stub(`
+        const fs = require("node:fs");
+        fs.writeFileSync(process.argv[1] + ".args",
+          JSON.stringify({ args: process.argv.slice(2), stdinIsPipe: fs.fstatSync(0).isFIFO() }));
+      `);
+      try {
+        const outcome = await runClaudeRefresh(bin, { cwd: dir, timeoutMs: 10_000 });
+        expect(outcome).toBe("completed");
+        const seen = JSON.parse(readFileSync(`${bin}.args`, "utf-8"));
+        expect(seen.args).toEqual([...CLAUDE_REFRESH_ARGS]);
+        expect(seen.args).toEqual(["-p", "/usage", "--safe-mode", "--no-session-persistence"]);
+        // stdin must not be an open pipe, or `claude -p` would wait on it.
+        expect(seen.stdinIsPipe).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reports failed_to_start for a missing binary", async () => {
+      expect(await runClaudeRefresh(join(tmpdir(), "definitely-not-a-claude-binary-xyz"))).toBe("failed_to_start");
+    });
+
+    it("resolves at the deadline even if the child ignores SIGTERM, then SIGKILLs it", async () => {
+      // A fake child makes this deterministic: no process start-up race with
+      // the deadline. It ignores SIGTERM and only exits on SIGKILL.
+      const signals: string[] = [];
+      let spawnedWith: unknown[] = [];
+      const fakeSpawn = ((...args: unknown[]) => {
+        spawnedWith = args;
+        const child = new EventEmitter() as EventEmitter & { kill: (sig: string) => boolean };
+        child.kill = (sig: string) => {
+          signals.push(sig);
+          if (sig === "SIGKILL") setImmediate(() => child.emit("exit", null, "SIGKILL"));
+          return true;
+        };
+        return child;
+      }) as unknown as typeof spawn;
+
+      const outcome = await runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn });
+      expect(outcome).toBe("timed_out");
+      // Resolved at the deadline: SIGTERM sent, SIGKILL not yet (still in grace).
+      expect(signals).toEqual(["SIGTERM"]);
+      expect(spawnedWith[0]).toBe("/fake/claude");
+      expect(spawnedWith[1]).toEqual([...CLAUDE_REFRESH_ARGS]);
+
+      const until = Date.now() + 2_000;
+      while (!signals.includes("SIGKILL") && Date.now() < until) await new Promise((r) => setTimeout(r, 5));
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    });
+
+    it("does not escalate to SIGKILL when the child exits after SIGTERM", async () => {
+      const signals: string[] = [];
+      const fakeSpawn = (() => {
+        const child = new EventEmitter() as EventEmitter & { kill: (sig: string) => boolean };
+        child.kill = (sig: string) => {
+          signals.push(sig);
+          setImmediate(() => child.emit("exit", null, sig));
+          return true;
+        };
+        return child;
+      }) as unknown as typeof spawn;
+
+      expect(await runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn })).toBe("timed_out");
+      await new Promise((r) => setTimeout(r, 80));
+      expect(signals).toEqual(["SIGTERM"]);
+    });
   });
 
   it("returns a FIXED network-error message that never echoes the raw error", async () => {
