@@ -16,6 +16,7 @@ import {
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { IdentityRouter, type SessionResolution } from "./router.js";
+import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
 import {
   annotateSenderName,
   autoBindHandle,
@@ -205,6 +206,8 @@ export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
   private router: IdentityRouter;
+  /** Owner-facing, rate-limited trace of inbound messages the admission gate refused. */
+  private readonly blockedInbound = new BlockedInboundLog();
   private sessionQueue = new SessionQueue();
   /** Per-key chain serializing /rewind (see rewindSession). */
   private rewinds = new Map<string, Promise<void>>();
@@ -493,15 +496,10 @@ export class Agent {
   /** Activate a group chat by adding it to the channel's allowlist */
   private async activateGroup(channel: Channel, chatId: string): Promise<void> {
     try {
-      // An open channel (no allowlist) already allows this group. Persisting a
-      // one-entry allowlist here would flip the whole channel to enforced and
-      // lock out every other chat — including the owner's own DM — until
-      // restart. Acknowledge and leave the config alone.
-      if (!this.router.hasAllowlist(channel.name)) {
-        log.info({ channel: channel.name, chatId }, "Group secret received; channel has no allowlist, group is already active");
-        await channel.send({ chatId, text: "Tomo is already active in this group." });
-        return;
-      }
+      // A channel with no allowlist has no active groups (admission fails
+      // closed), so the secret CREATES the list here. That no longer touches
+      // DMs: the owner's DM is admitted through its identity binding, not
+      // through the allowlist.
       const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
       const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
       if (!channels[channel.name]) channels[channel.name] = {};
@@ -512,9 +510,10 @@ export class Agent {
         cfg.channels = channels;
         backupConfigFile();
         writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
-        // Update the router's in-memory allowlist
-        this.router.addToAllowlist(channel.name, chatId);
       }
+      // Update the router's in-memory allowlist (also when the file already
+      // listed it, e.g. hand-edited since startup).
+      this.router.addToAllowlist(channel.name, chatId);
       log.info({ channel: channel.name, chatId }, "Group chat activated via secret");
       await channel.send({ chatId, text: "Tomo activated in this group." });
     } catch (err) {
@@ -523,6 +522,7 @@ export class Agent {
   }
 
   addChannel(channel: Channel): void {
+    this.warnIfChannelHasNoOwner(channel.name);
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
     // Same allowlist the ingress path enforces, offered to the channel early
     // so it can decline to DOWNLOAD what enqueueMessage is about to drop. It
@@ -532,6 +532,38 @@ export class Agent {
     channel.onCommand((cmd, chatId, senderName, args, senderId) =>
       this.commands.handle(channel, cmd, chatId, senderName, args, senderId));
     this.channels.push(channel);
+  }
+
+  /**
+   * Admission fails closed, so a provider channel nobody is bound to answers
+   * no DM at all. Say so once at startup, loudly, with the fix — otherwise a
+   * fresh iMessage setup just looks broken.
+   */
+  private warnIfChannelHasNoOwner(channelName: string): void {
+    if (channelName === "web") return;
+    if (!this.router.hasBoundIdentity(channelName)) {
+      log.warn(
+        { channel: channelName },
+        this.router.hasAllowlist(channelName)
+          ? "No identity binds a handle on this channel, so only DMs listed explicitly in its allowlist are answered. Run `tomo config` and bind your handle to your owner identity."
+          : "No identity binds a handle on this channel, so its DMs are ignored. Run `tomo config` and bind your handle to your owner identity.",
+      );
+    }
+    if (!this.router.hasAllowlist(channelName)) {
+      const passive = config.passiveGroups[channelName] ?? [];
+      if (passive.length > 0) {
+        log.warn(
+          { channel: channelName, passiveGroups: passive.length },
+          "passiveGroups are listed for this channel, but it has no allowlist, so those groups are not active. Send the group secret in each group, or add their ids to the channel's allowlist.",
+        );
+      }
+      log.info(
+        { channel: channelName },
+        config.groupSecret
+          ? "No group is activated on this channel yet; send the group secret in a group to activate it."
+          : "Group chats on this channel are off (no group is activated and no group secret is set). Enable them with `tomo config` → Group chats.",
+      );
+    }
   }
 
   /** The SDK session id behind a session key, or undefined before its first turn. */
@@ -633,7 +665,7 @@ export class Agent {
         this.enqueueForSession(`${channel.name}:${message.chatId}`, () => this.handleMessage(channel, message))
           .catch((err) => log.error({ err, chatId: message.chatId }, "Unhandled error in message queue"));
       } else {
-        log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked at receipt (not in allowlist)");
+        this.blockedInbound.record(channel.name, message.chatId, isGroup);
       }
       return true;
     }
@@ -1398,6 +1430,15 @@ export class Agent {
     const isGroup = message.isGroup ?? false;
     const isMentioned = message.isMentioned ?? false;
 
+    // Group secret activation, BEFORE anything logs or records the text: the
+    // secret is the only way into a closed group, so it must never reach the
+    // log file (or the transcript) verbatim.
+    if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
+      log.info({ channel: channel.name, chat: redactChatIdForLog(message.chatId) }, "Group secret received");
+      await this.activateGroup(channel, message.chatId);
+      return;
+    }
+
     log.info(
       {
         channel: channel.name,
@@ -1411,15 +1452,9 @@ export class Agent {
       message.text,
     );
 
-    // Group secret activation: if message matches the secret, add group to allowlist
-    if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
-      await this.activateGroup(channel, message.chatId);
-      return;
-    }
-
     // Allowlist check: reject messages from unknown senders
     if (!this.router.isAllowed(channel.name, message.chatId)) {
-      log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked (not in allowlist)");
+      log.debug({ channel: channel.name, chat: redactChatIdForLog(message.chatId) }, "Message blocked (not in allowlist)");
       return;
     }
 

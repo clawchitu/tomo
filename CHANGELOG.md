@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **DM admission fails closed.** A channel without an `allowlist` used to be open: on a fresh iMessage setup any phone number or email that texted the Mac got its own session with the owner's tools. Now a DM is answered only when it comes from a handle bound to an identity (or a chat listed explicitly in the channel's allowlist). Unknown senders get no reply, no session and no registry entry; Tomo logs one info line per sender per hour with the handle redacted. iMessage no longer loads a refused chat's attachments or marks it read.
+- **Groups on a channel without an allowlist are closed** (iMessage and Telegram alike). Send the group secret in a group to activate it; that now creates the channel's allowlist.
+- `/model` and `/restore` no longer fall open when no identity is configured.
+- `tomo config` → Channels → iMessage → Enable asks for the handle you text from and binds it to your identity; finishing without one needs an explicit confirmation.
+- iMessage handles are compared in one normal form, so formatting drift (`+1 (555) …`, case, `iMessage;-;` / `SMS;-;` / `any;-;` prefixes) no longer breaks the owner match.
+
+- The group activation secret is no longer written to the log; blocked-chat debug lines carry only the last four characters of the chat id.
+- iMessage handles must match exactly in E.164 form. A number written without `+` only counts as `+1…` when it has 11 digits starting with 1; anything else no longer matches its `+`-prefixed twin in another country. Setup now asks before reading an 11-digit number such as `150 1234 5678` as a US number.
+
+**Upgrade notes — check these before restarting:**
+
+- **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Identities, bind your Telegram user ID / iMessage handle (the daemon warns at startup for every channel no identity binds).
+- **Hand-written Telegram configs with no `allowlist` whose bot sits in groups: those groups go silent.** Fix: send the group secret in each group (`tomo config` → Group chats to enable or view it), or add the group ids (negative numbers) to `channels.telegram.allowlist`.
+- **`passiveGroups` entries on a channel with no allowlist stop working** (they are not activated). The daemon now warns at startup. Fix: the same — send the secret in each group, or add the ids to that channel's `allowlist`.
+- **Earlier `/summon`s of groups that are not activated stop working**: the group's messages are refused before the summon applies. Fix: activate the group (secret or allowlist), then `/summon` again if the summon has lapsed.
+- iMessage groups on a fresh setup (no allowlist) are off until activated the same way.
+
 ## 0.10.1 (2026-10-12)
 
 ### Bug fixes
