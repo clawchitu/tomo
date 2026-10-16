@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { hostname } from "node:os";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -147,7 +148,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("login", "99999", "Other", undefined, "99999");
 
     expect(fakeLogin.start).not.toHaveBeenCalled();
-    expect(tg.sent[0].text).toContain("configured owner");
+    expect(tg.sent[0].text).toContain("Only the owner");
 
     await agent.stop();
   });
@@ -171,7 +172,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("login", "12345", "Shuai", undefined, "12345");
 
     expect(fakeLogin.start).not.toHaveBeenCalled();
-    expect(tg.sent[0].text).toContain("No owner identity is configured");
+    expect(tg.sent[0].text).toContain("No owner is configured");
     expect(tg.sent[0].text).toContain("tomo config");
 
     await agent.stop();
@@ -452,7 +453,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("usage", "12345", "Other", undefined, "99999");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("configured owner");
+    expect(tg.sent[0].text).toContain("Only the owner");
 
     await agent.stop();
   });
@@ -468,7 +469,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("usage", "12345", "Anyone", undefined, "12345");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("No owner identity is configured");
+    expect(tg.sent[0].text).toContain("No owner is configured");
     expect(tg.sent[0].text).toContain("tomo config");
 
     await agent.stop();
@@ -972,6 +973,25 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/restore does not replace config.json while another writer holds the config lock", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "current" }, null, 2) + "\n");
+    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "backup" }, null, 2) + "\n");
+    // A live writer in another process (`tomo config` mid-save) holds the lock.
+    const lockPath = `${agentEnv.configFilePath}.lock`;
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, "owner.planted"), JSON.stringify({ pid: process.ppid, ts: Date.now(), host: hostname() }) + "\n");
+
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
+
+    expect(tg.sent[0].text).toContain("restore failed");
+    expect(JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8"))).toEqual({ model: "current" });
+    await agent.stop();
+  }, 15_000);
+
   it("/restore restores config.json from config.json.bak", async () => {
     resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
@@ -1060,9 +1080,10 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("still serves commands from allowlisted chats when an allowlist is configured", async () => {
+  it("still serves commands from the owner's DM when an allowlist is configured", async () => {
     resetConfig({
       channelAllowlists: { telegram: ["12345"] },
+      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -1091,7 +1112,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("restore", "-100777", "GroupMember", undefined, "99999");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("configured owner");
+    expect(tg.sent[0].text).toContain("Only the owner");
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as { model?: string };
     expect(cfg.model).toBe("claude-haiku-4-5");
 
@@ -1133,7 +1154,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "-100777", "GroupMember", "opus-1m", "99999");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("configured owner");
+    expect(tg.sent[0].text).toContain("Only the owner");
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };

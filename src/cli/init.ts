@@ -6,7 +6,9 @@ import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
-import { backupConfigIfParseableSync } from "./config/shared.js";
+import { backupConfigIfParseableSync, SDK_SESSIONS_DIR } from "./config/shared.js";
+import { SessionStore } from "../sessions/store.js";
+import { dmSessionKeyForIdentity } from "../sessions/keys.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { DEFAULT_MODEL } from "../models.js";
 
@@ -307,9 +309,16 @@ export const initCommand = new Command("init")
       const ownerIdentity = deriveOwnerIdentity(personality?.userName ?? "", userId);
       const config: Record<string, unknown> = {
         channels: {
-          telegram: { token: token as string, allowlist: [userId] },
+          // No allowlist: it only lists activated groups now; the owner's DMs
+          // are admitted through `owner`.
+          telegram: { token: token as string },
         },
-        identities: [ownerIdentity],
+        owner: {
+          name: ownerIdentity.name,
+          ...(personality?.userName?.trim() ? { displayName: personality.userName.trim() } : {}),
+          telegram: [userId],
+          imessage: [],
+        },
         model,
       };
       if ((city as string)?.trim()) {
@@ -321,8 +330,9 @@ export const initCommand = new Command("init")
 
       writeInitConfig(configPath, CONFIG_BACKUP_PATH, config);
       p.log.success("Config saved");
+      precreateOwnerSession(ownerIdentity.name);
       p.log.info(
-        `Owner identity "${ownerIdentity.name}" created — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Manage it later with \`tomo config\` → Identities.`,
+        `Owner "${ownerIdentity.name}" created (session dm:${ownerIdentity.name}) — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Add your iMessage handle later with \`tomo config\` → Owner.`,
       );
     }
 
@@ -385,6 +395,20 @@ export function writeInitConfig(configPath: string, backupPath: string, config: 
   mkdirSync(dirname(configPath), { recursive: true });
   backupConfigIfParseableSync(configPath, backupPath);
   writeJsonAtomicSync(configPath, config, { mode: 0o600 });
+}
+
+/**
+ * Create the owner's `dm:<name>` session entry right away, so every channel
+ * connected later (Telegram now, iMessage or the web UI later) binds to this
+ * one session instead of a per-channel one. Best-effort: the daemon creates
+ * it on first start anyway.
+ */
+export function precreateOwnerSession(ownerName: string, sessionsDir = SESSIONS_DIR, sdkSessionsDir = SDK_SESSIONS_DIR): void {
+  try {
+    new SessionStore(sessionsDir, 20, sdkSessionsDir).ensureEntry(dmSessionKeyForIdentity(ownerName));
+  } catch {
+    // The daemon's first start creates it.
+  }
 }
 
 export function deriveOwnerIdentity(
