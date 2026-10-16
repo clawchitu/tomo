@@ -23,7 +23,7 @@
 
 ```bash
 npm install -g tomo-ai
-tomo init       # Set up config, pick a name and personality
+tomo init       # Pick Telegram and/or iMessage, set yourself as the owner, choose a model
 tomo start      # Runs in background
 ```
 
@@ -35,12 +35,14 @@ HTTPS `web.externalOrigin`. Configure `web.enabled` and `web.port` in
 `config.json`; the web chat is always the owner's.
 See [web UI setup, security, and limits](docs/web-ui.md).
 
-That's it. Open Telegram and message your bot.
+That's it. Message Tomo on the channel you picked. `tomo init` creates your
+owner session (`dm:<name>`) up front, so a channel you connect later
+(`tomo config` → Owner / Channels) joins the same conversation.
 
 ## Requirements
 
 - Node.js 22.12+
-- [Claude Code](https://claude.com/claude-code) installed. Direct Claude models can use a Claude subscription or an Anthropic API key; LiteLLM gateways support other backends.
+- A Claude login or an Anthropic API key. Tomo runs the Claude Code binary bundled with its Agent SDK dependency, so a separate `claude` install is not required; `tomo init` offers to log in through it, and `/login` from your owner DM works later. LiteLLM gateways support other backends.
 - At least one channel:
   - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)
   - **iMessage** — the [imsg CLI](https://github.com/openclaw/imsg) on a Mac with iMessage signed in (Tomo needs Full Disk Access)
@@ -309,7 +311,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     },
     "imessage": { "provider": "imsg", "allowlist": ["any;+;<group-chat-guid>"] }
   },
-  "model": "claude-sonnet-5[1m]",
+  "model": "claude-opus-5-5[1m]",
   "litellm": {
     "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",
@@ -336,7 +338,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
 }
 ```
 
-To enable iMessage (the Tomo process needs Full Disk Access; advanced features additionally need `imsg launch`):
+To enable iMessage (the Tomo process needs Full Disk Access; advanced features additionally need `imsg launch`), pick it in `tomo init` or `tomo config` → Channels, or edit the config:
 
 ```json
 {

@@ -6,11 +6,36 @@ import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
-import { backupConfigIfParseableSync, SDK_SESSIONS_DIR } from "./config/shared.js";
-import { SessionStore } from "../sessions/store.js";
-import { dmSessionKeyForIdentity } from "../sessions/keys.js";
+import { backupConfigIfParseableSync, loadConfig, saveConfig } from "./config/shared.js";
+import { currentOwner, deriveOwnerName } from "./config/owner-setup.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { DEFAULT_MODEL } from "../models.js";
+import { DEFAULT_MODEL, PICKER_MODELS } from "../models.js";
+import {
+  buildInitConfig,
+  checkClaudeRuntime,
+  decideOwnerName,
+  envApiKeyNeedingSave,
+  mergeInitConfig,
+  precreateOwnerSessionUnlessAdoptable,
+  ownerSummary,
+  probeImsgCli,
+  runChannelSetup,
+  runInteractiveClaudeLogin,
+  type InitChannel,
+  type InitPromptPort,
+} from "./init-setup.js";
+
+/** @clack/prompts behind the port the channel step is tested through. */
+const initPrompts: InitPromptPort = {
+  text: (opts) => p.text(opts) as Promise<string | symbol>,
+  password: (opts) => p.password(opts) as Promise<string | symbol>,
+  confirm: (opts) => p.confirm(opts),
+  select: (opts) => p.select(opts) as Promise<string | symbol>,
+  multiselect: (opts) => p.multiselect(opts) as Promise<string[] | symbol>,
+  isCancel: (value: unknown): value is symbol => p.isCancel(value),
+  note: (message, title) => p.note(message, title),
+  log: { info: (m) => p.log.info(m), warn: (m) => p.log.warn(m), success: (m) => p.log.success(m) },
+};
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
@@ -54,38 +79,77 @@ export const initCommand = new Command("init")
     const configPath = CONFIG_PATH;
     const isReinit = existsSync(configPath) && !opts.force;
 
-    // 1. Prerequisites check (before anything else)
+    // 1. Prerequisites check (before anything else). Tomo runs Claude Code
+    // from the Agent SDK's bundled binary (sessions and /login alike), so no
+    // separately installed `claude` on PATH is required — only a login, or an
+    // API key.
     const s0 = p.spinner();
-    s0.start("Checking prerequisites");
-    const { execSync } = await import("node:child_process");
-    try {
-      const version = execSync("claude --version 2>/dev/null", { encoding: "utf-8" }).trim();
-      s0.stop(`Claude Code found (${version})`);
-
-      const s1 = p.spinner();
-      s1.start("Verifying Claude Code authentication");
-      try {
-        execSync('claude -p "say ok" --max-turns 1 2>/dev/null', {
-          encoding: "utf-8",
-          timeout: 30_000,
-        });
-        s1.stop("Claude Code authenticated");
-      } catch {
-        s1.stop("Claude Code not responding");
-        p.log.error("This could mean you're not logged in, or your usage limit has been reached.");
-        p.log.error("Run `claude` in your terminal to check, then try `tomo init` again.");
-        p.outro("Setup incomplete");
-        process.exit(1);
-      }
-    } catch {
-      s0.stop("Claude Code not found");
-      p.log.error("Claude Code is required. Install it: npm install -g @anthropic-ai/claude-code");
+    s0.start("Checking the Claude Code runtime");
+    const runtime = await checkClaudeRuntime();
+    if (runtime.kind === "missing") {
+      s0.stop("Claude Code runtime not found");
+      p.log.error("Tomo's bundled Claude Code binary did not run. Reinstall with `npm install -g tomo-ai`, or point TOMO_CLAUDE_PATH at a Claude Code binary.");
       p.outro("Setup incomplete");
       process.exit(1);
     }
+    if (runtime.kind === "unverified") {
+      s0.stop(`Claude Code found (${runtime.version}); login could not be checked`);
+      const why = runtime.reason === "rate-limited" ? "the Claude service is rate-limiting or overloaded"
+        : runtime.reason === "network" ? "the network or the Claude service is unreachable"
+        : "the check timed out";
+      p.log.warn(`Couldn't verify your Claude login because ${why}. That says nothing about the login itself — continuing. If Tomo doesn't answer later, retry \`tomo init\` or send /login from your owner DM.`);
+    } else if (runtime.kind === "ok") {
+      s0.stop(`Claude Code ready (${runtime.version}; ${runtime.auth === "api-key" ? "using ANTHROPIC_API_KEY" : "logged in"})`);
+    } else {
+      s0.stop(`Claude Code found (${runtime.version}) but not logged in`);
+      const login = await p.confirm({ message: "Log in to Claude now? (opens a browser)", initialValue: true });
+      if (!p.isCancel(login) && login && runInteractiveClaudeLogin()) {
+        p.log.success("Logged in to Claude");
+      } else {
+        p.log.warn([
+          "Continuing without a Claude login. Tomo will not answer until you either:",
+          "  • send /login from your owner DM once Tomo is running,",
+          "  • set an API key with `tomo config` → Anthropic authentication, or",
+          "  • run `tomo init` again.",
+        ].join("\n"));
+      }
+    }
+
+    // The current config (for --force: merged onto, never rebuilt from scratch).
+    let existingConfig: Record<string, unknown> | undefined;
+    if (existsSync(configPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(configPath, "utf-8")) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existingConfig = parsed as Record<string, unknown>;
+      } catch {
+        p.log.warn("The existing config.json does not parse; --force will replace it (it is kept as a backup only if it parses).");
+      }
+    }
+
+    // An API key only in the shell environment is invisible to the launchd
+    // autostart job: offer to save it, or say plainly that autostart lacks it.
+    let envApiKeyToSave: string | undefined;
+    const envApiKey = envApiKeyNeedingSave(runtime, process.env, existingConfig);
+    if (envApiKey) {
+      const save = await p.confirm({
+        message: "ANTHROPIC_API_KEY is set only in this shell. Save it to ~/.tomo/config.json (owner-only, 0600) so Tomo has it when it starts at login?",
+        initialValue: true,
+      });
+      if (!p.isCancel(save) && save) {
+        envApiKeyToSave = envApiKey;
+      } else {
+        p.log.warn("Not saved. Tomo started at login (launchd) will NOT see ANTHROPIC_API_KEY and will fall back to your Claude login. Save it later with `tomo config` → Anthropic authentication.");
+      }
+    }
 
     if (isReinit) {
-      p.log.info("Existing config found. Use --force to overwrite.");
+      p.log.info("Existing config found. Use --force to re-run setup (your other settings are kept).");
+      if (envApiKeyToSave) {
+        const cfg = loadConfig();
+        cfg.auth = { method: "api-key", apiKey: envApiKeyToSave };
+        saveConfig(cfg);
+        p.log.success("API key saved to config.json");
+      }
     }
 
     // 2. Safety disclaimer (first-time users only)
@@ -100,8 +164,8 @@ export const initCommand = new Command("init")
           "    bad input — double-check anything consequential.",
           "  • Prompt injection is real. Messages, emails, or web content Tomo",
           "    reads may contain hidden instructions that try to hijack the agent.",
-          "  • Keep the allowlist tight. Only let people you trust message Tomo —",
-          "    every allowed user can steer the agent.",
+          "  • Only you (the owner) get answered in DMs. Anyone in a group you",
+          "    activate can still steer the agent — activate groups with care.",
           "  • Run Tomo on a machine without sensitive data or credentials you",
           "    can't afford to expose. Treat it like a semi-trusted process.",
           "",
@@ -145,14 +209,25 @@ export const initCommand = new Command("init")
     }
     s.stop("Directory structure ready");
 
-    // 3. Workspace templates
+    // 3. Workspace templates. `--force` never overwrites the user's own
+    // personality / rules / memory files without asking.
+    const ownFiles = ["SOUL.md", "AGENT.md", "IDENTITY.md", join("memory", "MEMORY.md")]
+      .filter((f) => existsSync(join(WORKSPACE_DIR, f)));
+    let overwriteOwnFiles = false;
+    if (opts.force && ownFiles.length > 0) {
+      const ok = await p.confirm({
+        message: `Overwrite your existing ${ownFiles.join(", ")} with fresh templates? (No keeps them.)`,
+        initialValue: false,
+      });
+      overwriteOwnFiles = !p.isCancel(ok) && ok === true;
+    }
     s.start("Setting up workspace");
     const templates = ["SOUL.md", "AGENT.md", "IDENTITY.md"];
     const copied: string[] = [];
     for (const file of templates) {
       const dest = join(WORKSPACE_DIR, file);
       const src = join(DEFAULTS_DIR, file);
-      if ((!existsSync(dest) || opts.force) && existsSync(src)) {
+      if ((!existsSync(dest) || overwriteOwnFiles) && existsSync(src)) {
         let content = readFileSync(src, "utf-8");
         if (personality) {
           content = applyPersonality(file, content, personality);
@@ -183,7 +258,7 @@ export const initCommand = new Command("init")
     // MEMORY.md with initial content
     const memoryDir = join(WORKSPACE_DIR, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
-    if (!existsSync(memoryFile) || opts.force) {
+    if (!existsSync(memoryFile) || overwriteOwnFiles) {
       if (personality) {
         writeMemory(memoryDir, personality);
         copied.push("MEMORY.md");
@@ -200,68 +275,20 @@ export const initCommand = new Command("init")
     }
 
     // 4. Configuration
+    let channelsPicked: InitChannel[] = [];
     if (!isReinit) {
-      p.log.step("Telegram setup");
-      p.log.message([
-        "To connect Tomo to Telegram, you need a bot token:",
-        "",
-        "  1. Open Telegram and message @BotFather",
-        "  2. Send /newbot",
-        "  3. Choose a name (e.g., \"My Tomo\")",
-        "  4. Choose a username (must end in \"bot\", e.g., \"my_tomo_bot\")",
-        "  5. BotFather will reply with a token like: 123456:ABC-DEF...",
-        "  6. Also send /setprivacy → select your bot → Disable",
-        "     (so Tomo can read group messages)",
-        "",
-        "  Open BotFather: https://t.me/BotFather",
-      ].join("\n"));
-
-      const token = await p.text({
-        message: "Paste your bot token",
-        placeholder: "123456:ABC-DEF1234ghIkl-zyx57W2v...",
-        validate: (val) => {
-          if (!val?.trim()) return "Token is required.";
-          if (!/^\d+:.+$/.test(val.trim())) return "That doesn't look like a bot token. It should be like: 123456:ABC-DEF...";
-        },
-      });
-
-      if (p.isCancel(token)) {
+      p.log.step("Channels");
+      const setup = await runChannelSetup(initPrompts, { isMac: isMacOS(), probeImsg: () => probeImsgCli() });
+      if (!setup) {
         p.cancel("Setup cancelled.");
         process.exit(0);
       }
-
-      p.log.message([
-        "Your Telegram user ID is needed so only you can message the bot.",
-        "",
-        "  To find it: message @userinfobot on Telegram — it replies with your ID.",
-        "  It looks like: 123456789",
-        "",
-        "  You can add more allowed users later with `tomo config`.",
-      ].join("\n"));
-
-      const telegramUserId = await p.text({
-        message: "Your Telegram user ID",
-        placeholder: "e.g. 123456789",
-        validate: (val) => {
-          if (!val?.trim()) return "User ID is required for security.";
-          if (!/^\d+$/.test(val.trim())) return "User ID should be a number.";
-        },
-      });
-
-      if (p.isCancel(telegramUserId)) {
-        p.cancel("Setup cancelled.");
-        process.exit(0);
-      }
+      channelsPicked = setup.channels;
 
       const model = await p.select({
         message: "Default model",
-        options: [
-          { value: DEFAULT_MODEL, label: "Claude Sonnet 5 1M", hint: "fast, recommended, long context" },
-          { value: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "fast" },
-          { value: "claude-opus-5[1m]", label: "Claude Opus 5 1M", hint: "most capable, long context" },
-          { value: "claude-opus-5", label: "Claude Opus 5", hint: "most capable" },
-          { value: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "cheapest" },
-        ],
+        options: PICKER_MODELS.map((m) => ({ value: m.id, label: m.label, hint: m.hint })),
+        initialValue: DEFAULT_MODEL,
       });
 
       if (p.isCancel(model)) {
@@ -279,9 +306,9 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
-      // Group chat setup
+      // Group chats are off until a group is activated with this secret.
       const enableGroups = await p.confirm({
-        message: "Enable group chat support?",
+        message: "Enable group chats? (each group is activated by sending a secret in it)",
         initialValue: false,
       });
 
@@ -301,39 +328,52 @@ export const initCommand = new Command("init")
           `  ${groupSecret}`,
           "",
           "  Tomo will recognize it and start listening in that group.",
-          "  You can view this secret later with `tomo config`.",
+          "  Other groups stay off. You can view this secret later with `tomo config`.",
         ].join("\n"));
       }
 
-      const userId = (telegramUserId as string).trim();
-      const ownerIdentity = deriveOwnerIdentity(personality?.userName ?? "", userId);
-      const config: Record<string, unknown> = {
-        channels: {
-          // No allowlist: it only lists activated groups now; the owner's DMs
-          // are admitted through `owner`.
-          telegram: { token: token as string },
-        },
-        owner: {
-          name: ownerIdentity.name,
-          ...(personality?.userName?.trim() ? { displayName: personality.userName.trim() } : {}),
-          telegram: [userId],
-          imessage: [],
-        },
-        model,
-      };
-      if ((city as string)?.trim()) {
-        config.city = (city as string).trim();
+      // --force on an existing owner: owner.name is the session id. Keep it
+      // unless the user explicitly chooses a new one.
+      const previousOwner = existingConfig ? currentOwner(existingConfig).owner : undefined;
+      const ownerName = await decideOwnerName(initPrompts, previousOwner?.name, deriveOwnerName(personality?.userName ?? ""));
+      if (ownerName === null) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
       }
-      if (groupSecret) {
-        config.groupSecret = groupSecret;
+      // An existing group secret is kept unless a new one was just made.
+      if (!groupSecret && existingConfig?.groupSecret) {
+        p.log.info("Keeping your existing group secret and activated groups.");
       }
 
+      const { config: freshConfig, owner } = buildInitConfig({
+        ownerName,
+        ...(envApiKeyToSave ? { auth: { method: "api-key" as const, apiKey: envApiKeyToSave } } : {}),
+        userName: personality?.userName ?? "",
+        channels: setup.channels,
+        telegramToken: setup.telegramToken,
+        telegramUserId: setup.telegramUserId,
+        imessageHandles: setup.imessageHandles,
+        model: model as string,
+        city: (city as string) ?? "",
+        groupSecret,
+      });
+
+      const { config, kept, replaced } = mergeInitConfig(existingConfig, freshConfig, setup.channels);
       writeInitConfig(configPath, CONFIG_BACKUP_PATH, config);
-      p.log.success("Config saved");
-      precreateOwnerSession(ownerIdentity.name);
-      p.log.info(
-        `Owner "${ownerIdentity.name}" created (session dm:${ownerIdentity.name}) — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Add your iMessage handle later with \`tomo config\` → Owner.`,
-      );
+      p.log.success(kept.length > 0
+        ? `Config saved. Replaced: ${replaced.join(", ")}. Kept as they were: ${kept.join(", ")}.`
+        : "Config saved");
+      const finalOwner = currentOwner(config).owner ?? owner;
+      let sessionNote = "";
+      try {
+        const pre = precreateOwnerSessionUnlessAdoptable(finalOwner, SESSIONS_DIR, defaultRuntimePaths.sdkSessionsDir);
+        if (pre === "deferred-to-adoption") {
+          sessionNote = "\nYour earlier conversation will be adopted into this session (with its cron jobs and model) when Tomo starts.";
+        }
+      } catch {
+        // The daemon's first start creates it.
+      }
+      p.note(ownerSummary(finalOwner) + sessionNote, "Owner");
     }
 
     // 4b. Autostart (first-time only, macOS only)
@@ -370,18 +410,14 @@ export const initCommand = new Command("init")
       "Your files",
     );
 
+    const where = channelsPicked.length === 0 ? "" : ` on ${channelsPicked.map((c) => (c === "telegram" ? "Telegram" : "iMessage")).join(" or ")}`;
     if (isAutostartEnabled()) {
-      p.outro(`${agentLabel} is running — say hi on Telegram!`);
+      p.outro(`${agentLabel} is running — say hi${where}!`);
     } else {
       p.outro(`Run \`tomo start\` to meet ${agentLabel}!`);
     }
   });
 
-/** Owner identity seeded at init. Binding the owner's Telegram user ID makes
- *  owner-gated commands (/login, /model, /summon) work from day one and gives
- *  the owner's DM a unified dm:<name> session key. The name feeds that session
- *  key (lowercased by the router), so use only the first word of the display
- *  name and fall back to "owner" when none was given. */
 /**
  * Write the config `tomo init` assembled, rotating the previous file into
  * `backupPath` only if it parses.
@@ -395,32 +431,6 @@ export function writeInitConfig(configPath: string, backupPath: string, config: 
   mkdirSync(dirname(configPath), { recursive: true });
   backupConfigIfParseableSync(configPath, backupPath);
   writeJsonAtomicSync(configPath, config, { mode: 0o600 });
-}
-
-/**
- * Create the owner's `dm:<name>` session entry right away, so every channel
- * connected later (Telegram now, iMessage or the web UI later) binds to this
- * one session instead of a per-channel one. Best-effort: the daemon creates
- * it on first start anyway.
- */
-export function precreateOwnerSession(ownerName: string, sessionsDir = SESSIONS_DIR, sdkSessionsDir = SDK_SESSIONS_DIR): void {
-  try {
-    new SessionStore(sessionsDir, 20, sdkSessionsDir).ensureEntry(dmSessionKeyForIdentity(ownerName));
-  } catch {
-    // The daemon's first start creates it.
-  }
-}
-
-export function deriveOwnerIdentity(
-  userName: string,
-  telegramUserId: string,
-): { name: string; channels: Record<string, string>; replyPolicy: string } {
-  const first = userName.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
-  return {
-    name: first || "owner",
-    channels: { telegram: telegramUserId },
-    replyPolicy: "last-active",
-  };
 }
 
 async function askPersonality(): Promise<Personality | null> {
