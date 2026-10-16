@@ -718,9 +718,14 @@ export class LiveSessionManager {
       // not yet claimed the session included), it ends as interrupted.
       if (err instanceof TurnInterruptedError) throw err;
       if (token.interrupted) throw new TurnInterruptedError();
-      if (err instanceof SdkResultError) throw err;
+      // One exception: a resume that can't find its conversation. Current SDKs
+      // report it as a zero-turn error result instead of throwing, so nothing
+      // ran and the reset-and-retry below must still fire (see isResumeMissing).
+      if (err instanceof SdkResultError && !err.isResumeMissing) throw err;
 
-      const errMsg = err instanceof Error ? err.message : "";
+      // A missing-conversation result reaches here only with every error saying
+      // so (isResumeMissing); give it the phrase the retry path matches on.
+      const errMsg = err instanceof SdkResultError ? "No conversation found" : err instanceof Error ? err.message : "";
 
       if (this.stopping && errMsg.includes("closed")) {
         // FLUSH BEFORE CONVERTING, NOT AFTER — there is no after. Resolving
@@ -843,7 +848,9 @@ export class LiveSessionManager {
     try {
       response = await attempt();
     } catch (err) {
-      if (err instanceof SdkResultError) this.recordTurnCompletion(key, session);
+      // A failed resume ran nothing and is about to be retried: recording it
+      // would count one turn twice and persist nothing useful.
+      if (err instanceof SdkResultError && !err.isResumeMissing) this.recordTurnCompletion(key, session);
       throw err;
     }
     if (steer && response === STEER_MERGED) return response;
