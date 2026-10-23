@@ -18,6 +18,19 @@ import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.j
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
 /**
+ * How long a prompt-stale session may wait for its background tasks before it
+ * is retired anyway. Long enough for a typical subagent run, short enough that
+ * a hung task cannot pin a stale system prompt for the rest of the day.
+ */
+export const PROMPT_RETIRE_BACKGROUND_WAIT_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * After the background set drains, how long to wait for the follow-up turn
+ * that reports the finished task before retiring without it.
+ */
+export const PROMPT_RETIRE_REPORT_WAIT_MS = 10 * 60 * 1000;
+
+/**
  * Session-lifecycle failures that a reset-and-retry can genuinely fix:
  * a broken resume chain ("No conversation found") or the SDK child going
  * away ("Session is closed", process exit). Matched narrowly on purpose —
@@ -389,8 +402,45 @@ export class LiveSessionManager {
     // waitForIdle resolves when no turn is in flight, but a queued send()
     // woken by the same turn-completion can start a new turn before this
     // continuation runs — re-check so a live conversation is never cut.
-    while (session.isAlive() && session.isBusy()) {
-      await session.waitForIdle();
+    //
+    // Background tasks count too. A turn that launched a background subagent
+    // ends while the subagent keeps working, and close() kills it mid-run —
+    // so an edit to a prompt file (MEMORY.md, SOUL.md…) during a long agent
+    // run used to cut the agent off. Wait for the SDK to report the
+    // background set empty, but only up to a cap: a hung task must not keep
+    // a stale prompt alive forever.
+    // The cap starts at the first foreground-idle moment with background work,
+    // not when retirement was scheduled: a long turn must not use it up and
+    // leave a subagent it launched at the very end with no wait at all.
+    let backgroundDeadline: number | null = null;
+    let backgroundCapHit = false;
+    // Every exit from a wait re-checks isBusy(): a new turn can start while
+    // we wait on background work, and retiring then would reject it.
+    const waitingOnBackground = () =>
+      session.hasActiveBackgroundTasks() || session.isAwaitingTaskReport();
+    while (session.isAlive() && (session.isBusy() || (waitingOnBackground() && !backgroundCapHit))) {
+      if (session.isBusy()) {
+        await session.waitForIdle();
+        continue;
+      }
+      backgroundDeadline ??= Date.now() + PROMPT_RETIRE_BACKGROUND_WAIT_MS;
+      const remaining = backgroundDeadline - Date.now();
+      if (remaining <= 0) {
+        backgroundCapHit = true;
+      } else if (session.hasActiveBackgroundTasks()) {
+        log.info({ key }, "Prompt-stale session has live background tasks; deferring retirement");
+        if (!(await session.waitForBackgroundIdle(remaining))) backgroundCapHit = true;
+      } else {
+        // Drained: wait for the follow-up turn that reports the task's
+        // result. Bounded separately, since the result may instead have been
+        // folded into a turn that was already running.
+        if (!(await session.waitForTurnStart(Math.min(remaining, PROMPT_RETIRE_REPORT_WAIT_MS)))) {
+          backgroundCapHit = true;
+        }
+      }
+      if (backgroundCapHit) {
+        log.warn({ key }, "Prompt-stale session's background work outlasted the wait; retiring at the next idle boundary");
+      }
     }
     this.promptStale.delete(session);
     // Replaced or closed by another path (error reset, compact reload,
